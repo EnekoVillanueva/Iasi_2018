@@ -1,0 +1,253 @@
+---
+title: "Iasi Summer School"
+output:
+  html_notebook: default
+date: "July 2018"
+---
+
+# Introduction
+Here we will explore a SILAC experiment designed to identify the proteins which are enriched in the OOPS interface upon 254 nm UV crosslinking (CL) vs Non-crosslink (NC) control. Here we are focusing on applying a statistical test to identify the peptides which are significantly enriched.
+
+The input for this practical is the output from Proteome Discoverer with some additional information added by running a bespoke script (https://github.com/TomSmithCGAT/CamProt/blob/master/camprot/scripts/add_master_protein.py) which adds the following additional columns which we will use to filter the data:
+
+- "master_protein": Protein(s) which best explain the presence of the peptide
+- "unique": Can peptide be uniquely assigned to a single protein?
+- "crap_protein": Could peptide originate from a common contaminate (cRAP database)?
+- "associated_crap_protein": Could peptide originate from a protein which shares peptides with a common contaminate (likely to also be a contaminant)?
+
+The steps we will perform are:
+
+1. Read in the annotated output from Proteome Discoverer and filter to the peptides we can use for our analysis
+2. Aggregate to peptide-level and protein-level intensities
+3. Identify proteins with a significantly higher abundance following CL
+
+First, we need to load some basic data handling/plotting libraries
+```{r}
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+
+# set up a standardised plotting theme
+my_theme <- theme_bw() + theme(text=element_text(size=20), panel.grid=element_blank(), aspect.ratio=1)
+```
+
+### Step 1. Read in the data and filter
+We want to remove the following:
+
+1. Peptides which cannot be assigned to a single protein. We don't want to deal with "protein groups" here as we'd like to perform functional over-representation analyses downstream so we need to know precisely which proteins have been enriched by CL
+2. Peptides which could have come from a common contaminant (e.g keratin)
+```{r}
+# read in sample data
+raw_df <- read.delim("../Data/U2OS_Interface_peptides.txt", sep="\t", header=TRUE, stringsAsFactors=FALSE)  
+
+
+# separate the filename into its component parts
+raw_df <- raw_df %>%  separate(filename, sep="_", into = c("cell_line", "H", "L", "sample"), extra="drop")
+raw_df$replicate <- substr(raw_df$sample, 5,5) # Extract the replicate number from the sample name
+
+
+# function to output unique peptides and unique proteins
+count_p <- function(){
+  print(c(length(unique(raw_df$Sequence)), length(unique(raw_df$master_protein))))
+}
+
+# filter the raw data
+cat("\nCounts following filtering:\npeptides proteins\n")
+count_p()
+
+# 1. remove non-unique peptides, e.g peptides which can't be assigned to a single protein
+raw_df <- raw_df %>% filter(unique==1) 
+count_p()
+
+# remove peptides without a master protein assignment, e.g those which appear to come from a TrEMBL protein
+raw_df <- raw_df %>% filter(master_protein!="")
+count_p()
+
+# 2. Remove peptides matching a common contamination protein (cRAP database)
+raw_df <- raw_df %>% filter(crap_protein==0) 
+count_p()
+
+# 2. Remove peptides associated with a common contamination protein (cRAP database)
+raw_df <- raw_df %>% filter(associated_crap_protein==0) 
+count_p()
+
+# Find the light and heavy quantification columns
+light_column = colnames(raw_df)[grep("Abundance.F[0-9]+.Light.Sample", colnames(raw_df))]
+heavy_column = colnames(raw_df)[grep("Abundance.F[0-9]+.Heavy.Sample", colnames(raw_df))]
+
+# Select only the columns we're interested in
+raw_intensity <- raw_df %>% select("Sequence", "Modifications", "master_protein", light_column, heavy_column, "cell_line", "replicate")
+
+# rename columns
+colnames(raw_intensity)[4:5] <- c("Light","Heavy")  
+
+## IMPORTANT STEP: ##
+# Identify the NC & CL intensities given the label switching (Replicates 1 & 2, CL=Heavy, Replicates 3 & 4, CL=Light)
+raw_intensity$CL <- ifelse(raw_intensity$replicate %in% c(1, 2), raw_intensity$Heavy, raw_intensity$Light)
+raw_intensity$NC <- ifelse(raw_intensity$replicate %in% c(1, 2), raw_intensity$Light, raw_intensity$Heavy)
+```
+
+
+### Step 2. Aggregate to peptide
+Since we may observe the same peptide (same Sequence) with variable modifications caused by the sampling handling (e.g oxidation) we need to sum the intensities for each unique peptide (in each sample)
+```{r}
+agg_peptide <- raw_intensity %>%
+  group_by(master_protein, Sequence, replicate)  %>%
+  summarise(NC=sum(NC), CL=sum(CL))
+
+# log2-transform the intensities
+agg_peptide$NC <- log(agg_peptide$NC,2)
+agg_peptide$CL <- log(agg_peptide$CL,2)
+  
+agg_peptide <- agg_peptide %>% mutate(Peptide_Ratio=CL-NC)
+```
+
+Below we plot the overall distribution of peptide ratios. We expect that peptides from proteins which are not enriched by CL should have a CL:NC ratio ~1, 0 in log2 space. If our heavy label incorporation was incomplete, the non-enriched peptides would be shifted from 0. We can see below that the peak around 0 is very slightly above 0 for replicates replicates 3 & 4 where CL was "Light" and NC "Heavy". It's not usually possible to reach perfect 100% incorporation and by switching the labels we can be sure this doesn't affect our final results.
+
+Note also that there is seconda distribution of of peptides with a positive ratio. These are the peptides from proteins which are enriched by CL.
+```{r, fig.height=5, fig.width=5}
+
+p <- ggplot(agg_peptide, aes(Peptide_Ratio, colour=replicate)) +
+  geom_vline(xintercept = 0, linetype=2, colour="grey25") +
+  geom_density() +
+  scale_color_discrete(name="Replicate") +
+  xlab("Peptide Ratio (Log2)") + ylab("Density") +
+  xlim(-10, 10) +
+  my_theme
+
+print(p)
+```
+
+We'd like to see how the plot above looks if we separate into GO annotated RBPs, putative novel RBPs and glycoproteins. First we need to add this information to the data
+```{r}
+### Load glycoprotein and GO_RBPs (These have been derived elsewhere, glycoproteins dervied from parsing Uniprot annotations)
+glycoproteins <- readLines("../Data/glycoproteins.tsv")
+RBPs <-readLines("../Data/GO_RBPs.tsv")
+
+# add annotations
+agg_peptide <- agg_peptide %>%
+  mutate(GO_RBP=as.numeric(master_protein %in% RBPs),
+         Glycoprotein=as.numeric(master_protein %in% glycoproteins))
+
+agg_peptide$Class <- interaction(agg_peptide$GO_RBP, agg_peptide$Glycoprotein)
+
+# recode the annotations so they make more intuitive sense
+agg_peptide$Class <- recode(factor(agg_peptide$Class),
+                                   "1.0"="RBP",
+                                   "0.1"="Glycoprotein",
+                                   "1.1"="RBGP",
+                                   "0.0"="Putative RBP")
+
+agg_peptide$Class <- factor(agg_peptide$Class, levels=c("RBP","Putative RBP", "Glycoprotein", "RBGP"))
+```
+
+We can see that the glycoproteins are almost entirely centered around 0, in contrast to the GO annotated RBPs and the putative novel RBPs
+```{r}
+# note we remove RNA binding Glycorproteins (RBGP) as they are very few and we're not interested in this particular class of proteins right now
+p <- agg_peptide %>% filter(Class != "RBGP") %>% ggplot(aes(Peptide_Ratio, colour=Class)) +
+  geom_vline(xintercept = 0, linetype=2, colour="grey25") +
+  geom_density() +
+  scale_color_discrete(name="Replicate") +
+  xlab("Peptide Ratio (Log2)") + ylab("Density") +
+  xlim(-10, 10) +
+  my_theme
+
+print(p)
+```
+
+### Step 3. Aggregate to proteins
+Although we have measured peptide intensities in the MS, in the experiment itself we enriched proteins not peptides at the interface and thus we apply our statistical test at the level of protein abundance.
+
+```{r}
+agg_protein <- agg_peptide %>%
+  group_by(master_protein, replicate, Class)  %>%
+  summarise(NC=median(NC), CL=median(CL))
+
+# get the protein-level CL:NC ratio
+agg_protein <- agg_protein %>% mutate(Protein_Ratio=CL-NC)
+
+print(head(agg_protein))
+```
+
+
+Now we want to identify proteins which are significantly enriched in CL. To do this we will apply a simple paired Student's t-test to compare the CL and NC intensities. We're using a paired test since the CL and NC values are paired by the replicate number. This is identical to testing whether the ratio is significantly different from zero using a one sample t-test.
+
+
+**The assumptions for a Student's t-test are:**
+
+1. The dependent variable must be continuous and Gaussian (Normal) distribution: _It's safe to assume the logged protein intensities are approximately Gaussian_
+2. The observations are independent of one another: _This is true_
+3. Homogeneity of variance: _We haven't formally shown this here but the variance is sufficiently homogenous_
+
+In this case we only want to find proteins with an increase in intensity in CL so we will specify that the alternative hypothesis is that the difference is > 0.
+```{r}
+
+# function which we apply to each protein
+runTTest <- function(data){
+  t_test <- suppressMessages(t.test(data$CL, data$NC, alternative="greater", paried=TRUE))
+  return(data.frame("n_obs"=length(t_test$CL), "p.value"=t_test$p.value))
+}
+
+sig_changes <- agg_protein %>%
+  group_by(master_protein) %>% # group by proteins
+  filter(n()>=3) %>% # Remove proteins observed in< 3 replicates
+  do(runTTest(.)) # run t-test on each protein
+
+sig_changes$BH <- p.adjust(sig_changes$p.value, method="BH") # Obtain an estimate of the False Discovery Rate using Benjamini Hochberg method
+sig_changes$sig <- sig_changes$BH<0.05 # Use a 5% FDR threshold to detect significantly enriched proteins
+
+```
+
+How many proteins are significantly enriched?
+```{r}
+print(table(sig_changes$sig))
+```
+
+
+```{r}
+final_results <- agg_protein %>%
+  group_by(master_protein, Class) %>% summarise(Mean_Protein_Ratio=mean(Protein_Ratio)) %>%
+  merge(sig_changes, by=c("master_protein"), all.x=TRUE)
+
+p <- final_results %>% filter(!is.na(BH)) %>%
+  ggplot(aes(Mean_Protein_Ratio, fill=ifelse(sig, "Sig.", "Not Sig."))) +
+  geom_histogram(alpha=0.65, position="identity") +
+  scale_fill_discrete(name="") +
+  my_theme +
+  geom_vline(xintercept=0, linetype=2, colour="grey50") +
+  xlab("Median ratio")+
+  ylab("# proteins")
+
+print(p)
+
+
+```
+
+As we would expect, we have far more GO annotated RBPs which are significantly enriched by CL. In addition, these GO:RBPs are more enriched.
+```{r, fig.width=10, fig.height=6}
+
+# change the dataset to exlcude RBGPs and facet plot by "Class"
+p <- p %+% final_results[(is.finite(final_results$BH) & final_results$Class != "RBGP"),] +
+  facet_grid(Class~., scales="free_y")
+
+print(p)
+
+```
+
+### Write out the final results
+```{r}
+write.table(final_results, "../Results/Protein_enrichment.txt", sep="\t", row.names=FALSE, col.names=F)
+```
+
+### Write out the significant proteins 
+```{r}
+final_results %>%
+  filter(sig) %>%
+  pull(master_protein) %>%
+  unique() %>% 
+  writeLines("../Results/Sig_prots.txt")
+```
+
+We'll perform the functional enrichment analysis using the online tool STRING (https://string-db.org). Given a list of proteins, STRING builds a network by forming links between the proteins using co-expression data etc. 
+
+In addition, STRING will compare the GO terms and KEGG pathways annotated to the proteins in the list and compare this to the complete set of proteins for the organism and determine which are enriched in the protein list. This is useful to get a quick feel for which functional groups of related proteins are over-represented in our protein list. However, there are a number of issues with using STRING for such an analysis. Have a think about why performing a functional enrichment analysis as described is over-simplistic and how this might affect the final results.

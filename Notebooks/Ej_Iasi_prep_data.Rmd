@@ -1,0 +1,111 @@
+---
+title: "Prepare toy data"
+---
+
+
+```{r}
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(plyr)
+
+count <- dplyr::count
+group_by <- dplyr::group_by
+mutate <- dplyr::mutate
+select <- dplyr::select
+summarise <- dplyr::summarise
+```
+
+```{r}
+raw_df <- read.delim("../Data/Interface_U2OS_sw_only.txt", sep="\t", header=TRUE, stringsAsFactors=FALSE)  
+
+
+# separate the filename into its component parts
+raw_df <- raw_df %>%  separate(filename, sep="_", into = c("cell_line", "H", "L", "sample"), extra="drop", remove=FALSE)
+raw_df$replicate <- substr(raw_df$sample, 5,5) # Extract the replicate number from the sample name
+raw_df$dosage <- substr(raw_df$sample, 1,3) # Extract the replicate number from the sample name
+
+raw_df <- raw_df %>% filter(dosage==400)
+
+# Find the light and heavy quantification columns
+light_column = colnames(raw_df)[grep("Abundance.F[0-9]+.Light.Sample", colnames(raw_df))]
+heavy_column = colnames(raw_df)[grep("Abundance.F[0-9]+.Heavy.Sample", colnames(raw_df))]
+
+# Select only the columns we're interested in
+#raw_intensity <- raw_df %>% select("Sequence", "Modifications", "master_protein", light_column, heavy_column, "cell_line", "replicate")
+#colnames(raw_intensity)[4:5] <- c("Light","Heavy")  
+
+raw_intensity <- raw_df
+
+raw_intensity$CL <- ifelse(raw_intensity$replicate %in% c(1, 2), raw_intensity[[heavy_column]], raw_intensity[[light_column]])
+raw_intensity$NC <- ifelse(raw_intensity$replicate %in% c(1, 2), raw_intensity[[light_column]], raw_intensity[[heavy_column]])
+raw_intensity$CL <- as.numeric(as.character(raw_intensity$CL))
+raw_intensity$NC <- as.numeric(as.character(raw_intensity$NC))
+
+raw_intensity <- raw_intensity %>% filter(is.finite(CL))
+
+
+```
+
+
+```{r}
+c <- 0
+
+raw_intensity2 <- raw_intensity
+raw_intensity2$pseudo = FALSE
+
+replicate_ratio_means <- c(4.8, 4.9, 5.2, 5.1)
+names(replicate_ratio_means) <- c(1,2,3,4)
+
+for (r in unique(raw_intensity2$replicate)){
+  tmp_df <- raw_intensity2 %>% filter(replicate==r)
+  for (p in unique(tmp_df$master_protein)){
+    if(p==""){
+      next
+    }
+    
+    tmp_df2 <- tmp_df %>% filter(master_protein==p)
+    
+    if(tmp_df2$crap_protein[1]==1){
+      next
+    }
+    
+    all_ratios <- raw_intensity2 %>% filter(master_protein==p)
+    ratios <- all_ratios$CL/all_ratios$NC
+    ratios_mean <- mean(ratios, na.rm=TRUE)
+    ratios_sd <- sd(ratios, na.rm=TRUE)
+
+    if(is.nan(ratios_mean)){
+      ratios_mean <- 2**rnorm(1, replicate_ratio_means[r], 2)
+      ratios_sd <- ratios_mean/10
+    }
+    
+    tmp_df2$pseudo <- is.na(tmp_df2$NC)
+    tmp_df2$NC[is.na(tmp_df2$NC)] <- round_any(tmp_df2$CL[is.na(tmp_df2$NC)]/rnorm(1,ratios_mean, ratios_sd), 1000)
+      
+    raw_intensity2[(raw_intensity2$replicate==r & raw_intensity2$master_protein==p),] <- tmp_df2
+    
+    c <- c + 1
+  }
+  print(r)
+}
+
+print(c)
+print(min(raw_intensity2$CL, na.rm=TRUE))
+
+raw_intensity2 <- raw_intensity2 %>% filter(NC > min(raw_intensity2$CL))
+raw_intensity2 %>% filter(pseudo, replicate==r, !is.na(NC)) %>% select(master_protein, NC, CL)
+
+raw_intensity2[[heavy_column]] <- ifelse(raw_intensity2$replicate %in% c(1, 2), raw_intensity2$CL, raw_intensity2$NC)
+raw_intensity2[[light_column]] <- ifelse(raw_intensity2$replicate %in% c(1, 2), raw_intensity2$NC, raw_intensity2$CL)
+
+
+```
+
+
+```{r}
+raw_intensity2 %>% select(-pseudo, -H, -L, -sample, -replicate, -dosage, -CL, -NC, -cell_line) %>% filter(master_protein!="") %>%
+  write.table("../Data/U2OS_Interface_peptides.txt", sep="\t", row.names=FALSE, quote=FALSE)
+
+```
+
